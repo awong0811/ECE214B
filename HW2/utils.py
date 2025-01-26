@@ -4,6 +4,42 @@ import scipy
 import librosa
 import scipy.fftpack as fft
 from scipy.signal import get_window
+import matplotlib.pyplot as plt
+
+# Plotting
+def plot(features, ncc: int,feat: str):
+    if feat!='mfcc' and feat!='lpcc':
+        raise ValueError('Feature must be mfcc or lpcc')
+    cep_coeff, cep_coeff_weighted, cep_coeff_delta_1, cep_coeff_delta_2 = features
+    plt.figure(figsize=(15,15))
+    plt.subplot(4, 1, 1)
+    plt.imshow(cep_coeff, aspect='auto', origin='lower')
+    plt.title(f'{feat.upper()}s (n{feat}={ncc})')
+    plt.grid(True)
+    plt.subplot(4, 1, 2)
+    plt.imshow(cep_coeff_weighted, aspect='auto', origin='lower')
+    plt.title(f'{feat.upper()}s (Weighted, n{feat}={ncc})')
+    plt.grid(True)
+    plt.subplot(4, 1, 3)
+    plt.imshow(cep_coeff_delta_1, aspect='auto', origin='lower')
+    plt.title(f'{feat.upper()}s (Delta 1, n{feat}={ncc})')
+    plt.grid(True)
+    plt.subplot(4, 1, 4)
+    plt.imshow(cep_coeff_delta_2, aspect='auto', origin='lower')
+    plt.title(f'{feat.upper()}s (Delta 2, n{feat}={ncc})')
+    plt.grid(True)
+    return
+
+# Add noise
+def add_noise(signal, snr_db):
+    signal_power = np.mean(signal**2)
+    # convert SNR from dB to linear scale
+    snr_linear = 10 ** (snr_db / 10)
+    noise_power = signal_power / snr_linear
+    # generate white Gaussian noise
+    noise = np.sqrt(noise_power) * np.random.normal(size=signal.shape)
+    noisy_signal = signal + noise
+    return noisy_signal
 
 # MFCCs
 def preemphasis(signal: np.ndarray, alpha=0.95) -> np.ndarray:
@@ -76,7 +112,48 @@ def dct(dct_filter_num, filter_len):
         
     return basis
 
+def parameter_weighting(cep_coeffs, Q=None):
+    if not Q:
+        Q = len(cep_coeffs)-1
+    if len(cep_coeffs)>Q+1:
+        raise ValueError("Choose a larger Q")
+    bandpass_lifter = np.sin(np.arange(len(cep_coeffs))*np.pi/Q)*Q/2+1
+    return bandpass_lifter[:, np.newaxis]*cep_coeffs
+
+def mfcc(y: np.ndarray, sr: int, n_mfcc=13, mel_filter_num=40):
+    preemphasized = preemphasis(signal=y)
+    frames = frame_audio(preemphasized)
+    windowed = window_frames(frames)
+    audio_power = fft_frames(windowed)
+    freq_min = 0
+    freq_high = sr / 2
+    # mel_filter_num = 40
+    filter_points, mel_freqs = get_filter_points(freq_min, freq_high, mel_filter_num, sample_rate=sr)
+    filters = get_filters(filter_points)
+    enorm = 2.0 / (mel_freqs[2:mel_filter_num+2] - mel_freqs[:mel_filter_num])
+    filters *= enorm[:, np.newaxis]
+    audio_filtered = filters@audio_power.T
+    audio_log = 10*np.log10(audio_filtered+1e-9)
+    dct_filters = dct(n_mfcc, mel_filter_num)
+    mfcc = dct_filters @ audio_log
+    mfcc_weighted = parameter_weighting(mfcc)
+    print(mfcc_weighted.shape)
+    delta_1 = librosa.feature.delta(mfcc_weighted, order=1, axis=1)
+    delta_2 = librosa.feature.delta(mfcc_weighted, order=2, axis=1)
+    return mfcc, mfcc_weighted, delta_1, delta_2
+
 # LPCCs
+def lpcc(y, n_lpcc=13, order=12):
+    lpc, error = compute_lpc(y, order)
+    lpcc = compute_lpcc(lpc, error, n_lpcc)
+    lpcc_weighted = []
+    for i in range(lpcc.shape[1]):
+        lpcc_weighted.append(parameter_weighting(lpcc[:,i]))
+    lpcc_weighted = np.vstack(lpcc_weighted).T
+    delta_1 = librosa.feature.delta(lpcc_weighted, order=1, axis=1)
+    delta_2 = librosa.feature.delta(lpcc_weighted, order=2, axis=1)
+    return lpcc, lpcc_weighted, delta_1, delta_2
+
 def compute_lpc(audio, order=12):
     preemphasized = preemphasis(audio)
     frames = frame_audio(preemphasized)
@@ -122,11 +199,3 @@ def lpc_to_cc(lpc_coeffs, num_cepstral, pred_error_power):
         cep_coeffs[m] += summation/m
 
     return cep_coeffs
-
-def parameter_weighting(cep_coeffs, Q=None):
-    if not Q:
-        Q = len(cep_coeffs)-1
-    if len(cep_coeffs)>Q+1:
-        raise ValueError("Choose a larger Q")
-    bandpass_lifter = np.sin(np.arange(len(cep_coeffs))*np.pi/Q)*Q/2+1
-    return bandpass_lifter*cep_coeffs
